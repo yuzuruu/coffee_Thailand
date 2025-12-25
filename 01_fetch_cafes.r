@@ -175,6 +175,7 @@ readr::write_rds(
   cafe_osm_chiangmai,
   "data/cafes_osm_chiangmai_nearby.rds"
 )
+
 # 
 # ---- cafe.specification.google ----
 # 
@@ -217,98 +218,79 @@ n_tiles <-
 # 
 # function to obtain name and location of cafe shops
 # radius (=5,000) refers to size of searching area (5,000m) 
-fetch_nearby_cafes <- function(lat, lon, radius = 5000, key) {
-  # a helper to obtain lat / lon from geometry
-  flatten_results_with_coords <- 
-    function(results) {
-      # unnest objects containing geometry
-      results2 <-
-        results %>%
-        tidyr::unnest_wider(
-          geometry,
-          names_sep = "."
-          )
-      # if the geometry is provided as a variable named "geometry.location",
-      # split the variable by .
-      # Or else, return the results accordingly.
-      if ("geometry.location" %in% names(results2)) {
-        results3 <- 
-          results2 %>%
-          tidyr::unnest_wider(
-            geometry.location, 
-            names_sep = "."
-            )
-        } 
-      else {
-        results3 <- results2
-        }
-      if (!all(c("geometry.location.lat", "geometry.location.lng") %in% names(results3))) {
-        stop("Could not find geometry.location.lat / lng")
-        }
-      results3
+fetch_nearby_cafes <- function(lat, lon, radius = 5000, place_type = "cafe",
+                               max_pages = 3, page_sleep = 2.2) {
+  
+  flatten_results_with_coords <- function(results) {
+    results2 <- results %>%
+      tidyr::unnest_wider(geometry, names_sep = ".")
+    
+    if ("geometry.location" %in% names(results2)) {
+      results3 <- results2 %>%
+        tidyr::unnest_wider(geometry.location, names_sep = ".")
+    } else {
+      results3 <- results2
     }
-  # 
-  # call Google API and assign results into res1
-  res1 <- 
+    
+    if (!all(c("geometry.location.lat", "geometry.location.lng") %in% names(results3))) {
+      stop("Could not find geometry.location.lat / lng")
+    }
+    results3
+  }
+  
+  # --- helper: one page request (token may be NULL) ---
+  get_page <- function(token = NULL) {
     try(
       googleway::google_places(
-        location = c(lat, lon),
-        radius   = radius,
-        keyword  = "cafe"
-        ),
-    silent = TRUE
-  )
-  # for checking status
-  # --- start status check ---
-  # in case of malfunction of google_places
-  if (inherits(res1, "try-error")) {
-    return(list(
-      status = "TRY_ERROR",
-      df     = tibble()
-      ))
-    }
-  # 
-  status1 <- res1$status
-  # 
-  if (!status1 %in% c("OK", "ZERO_RESULTS")) {
-    return(list(
-      status = status1,
-      df     = tibble()
-      ))
-    }
-  # 
-  if (identical(status1, "ZERO_RESULTS")) {
-    return(list(
-      status = status1,
-      df     = tibble()
-      ))
-    }
-  # 
-  # assign available results
-  results <-
-    res1$results
-
-  if (is.null(results) || nrow(results) == 0) {
-    return(list(
-      status = status1,
-      df     = tibble()
-      ))
-  }
-  # --- end status check ---
-  # expand geometry and obtain  lat / lon
-  results_flat <- 
-    try(
-      flatten_results_with_coords(results), 
+        location   = c(lat, lon),
+        radius     = radius,
+        place_type = place_type,
+        page_token = token
+      ),
       silent = TRUE
-      )
-  # 
-  if (inherits(results_flat, "try-error")) {
-    return(list(
-      status = "NO_GEOM_COL",
-      df     = tibble()
-    ))
+    )
   }
-  # make a data frame containing results
+  
+  # --- page 1 ---
+  res1 <- get_page(NULL)
+  
+  if (inherits(res1, "try-error")) {
+    return(list(status = "TRY_ERROR", df = tibble::tibble(), next_page_token = NA_character_))
+  }
+  
+  status1 <- res1$status
+  if (!status1 %in% c("OK", "ZERO_RESULTS")) {
+    return(list(status = status1, df = tibble::tibble(), next_page_token = res1$next_page_token %||% NA_character_))
+  }
+  if (identical(status1, "ZERO_RESULTS") || is.null(res1$results) || nrow(res1$results) == 0) {
+    return(list(status = status1, df = tibble::tibble(), next_page_token = res1$next_page_token %||% NA_character_))
+  }
+  
+  all_results <- res1$results
+  token <- res1$next_page_token
+  
+  # --- pages 2..max_pages ---
+  if (max_pages > 1) {
+    for (i in 2:max_pages) {
+      if (is.null(token) || is.na(token) || token == "") break
+      Sys.sleep(page_sleep)  # next_page_token activation wait
+      
+      resi <- get_page(token)
+      if (inherits(resi, "try-error")) break
+      if (!identical(resi$status, "OK")) break
+      if (is.null(resi$results) || nrow(resi$results) == 0) break
+      
+      all_results <- dplyr::bind_rows(all_results, resi$results)
+      token <- resi$next_page_token
+    }
+  }
+  
+  # --- flatten geometry once at the end ---
+  results_flat <- try(flatten_results_with_coords(all_results), silent = TRUE)
+  if (inherits(results_flat, "try-error")) {
+    return(list(status = "NO_GEOM_COL", df = tibble::tibble(), next_page_token = token %||% NA_character_))
+  }
+  
   df <- dplyr::tibble(
     place_id = results_flat$place_id,
     name     = results_flat$name,
@@ -316,13 +298,19 @@ fetch_nearby_cafes <- function(lat, lon, radius = 5000, key) {
     lon      = as.numeric(results_flat$geometry.location.lng),
     rating   = results_flat$rating,
     user_ratings_total = results_flat$user_ratings_total
-  )
-  # make a list from the data frame and status
+  ) %>%
+    dplyr::distinct(place_id, .keep_all = TRUE)
+  
   list(
-    status = status1,
-    df     = df
+    status = "OK",
+    df = df,
+    next_page_token = token %||% NA_character_
   )
 }
+
+# helper for %||% (NULL coalesce)
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
 # run function and obtain 
 with_progress(
   {
@@ -335,7 +323,7 @@ with_progress(
         .f = 
           ~ 
           {
-            out <- fetch_nearby_cafes(lat = .x, lon = .y)
+            out <- fetch_nearby_cafes(lat = .x, lon = .y, radius = 5000, max_pages = 3, page_sleep = 2.2)
             Sys.sleep(0.3)   # regulation
             p()              # 
             out
